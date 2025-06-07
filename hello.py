@@ -1,3 +1,4 @@
+# Codex で編集
 def main():
     print("hello codex")
 
