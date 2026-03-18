@@ -1,0 +1,220 @@
+# Plane CE v1.2.3 - Self-hosted on UGREEN DXP4800 Plus
+# Cloudflare Tunnel経由でアクセスするため、proxyサービスはport 8082でリッスン
+# 既存コンテナ(AdGuard Home, Stirling PDF等)とのポート競合を回避
+
+x-db-env: &db-env
+  PGHOST: plane-db
+  PGDATABASE: plane
+  POSTGRES_USER: plane
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: plane
+  POSTGRES_PORT: 5432
+  PGDATA: /var/lib/postgresql/data
+
+x-redis-env: &redis-env
+  REDIS_HOST: plane-redis
+  REDIS_PORT: 6379
+  REDIS_URL: redis://plane-redis:6379/
+
+x-minio-env: &minio-env
+  MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
+  MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
+
+x-aws-s3-env: &aws-s3-env
+  AWS_REGION: ""
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  AWS_S3_ENDPOINT_URL: http://plane-minio:9000
+  AWS_S3_BUCKET_NAME: uploads
+
+x-proxy-env: &proxy-env
+  APP_DOMAIN: plane.aloha-88.com
+  FILE_SIZE_LIMIT: ${FILE_SIZE_LIMIT:-5242880}
+  LISTEN_HTTP_PORT: 80
+  LISTEN_HTTPS_PORT: 443
+  BUCKET_NAME: uploads
+  SITE_ADDRESS: ":80"
+
+x-mq-env: &mq-env
+  RABBITMQ_HOST: plane-mq
+  RABBITMQ_PORT: 5672
+  RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+  RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+  RABBITMQ_DEFAULT_VHOST: plane
+  RABBITMQ_VHOST: plane
+
+x-live-env: &live-env
+  API_BASE_URL: http://api:8000
+  LIVE_SERVER_SECRET_KEY: ${LIVE_SERVER_SECRET_KEY}
+
+x-app-env: &app-env
+  WEB_URL: https://plane.aloha-88.com
+  DEBUG: "0"
+  CORS_ALLOWED_ORIGINS: https://plane.aloha-88.com
+  GUNICORN_WORKERS: 1
+  USE_MINIO: "1"
+  DATABASE_URL: postgresql://plane:${POSTGRES_PASSWORD}@plane-db/plane
+  SECRET_KEY: ${SECRET_KEY}
+  AMQP_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@plane-mq:5672/plane
+  API_KEY_RATE_LIMIT: 60/minute
+  MINIO_ENDPOINT_SSL: "0"
+  LIVE_SERVER_SECRET_KEY: ${LIVE_SERVER_SECRET_KEY}
+
+services:
+  web:
+    image: artifacts.plane.so/makeplane/plane-frontend:v1.2.3
+    container_name: plane-web
+    restart: always
+    depends_on:
+      - api
+      - worker
+
+  space:
+    image: artifacts.plane.so/makeplane/plane-space:v1.2.3
+    container_name: plane-space
+    restart: always
+    depends_on:
+      - api
+      - worker
+      - web
+
+  admin:
+    image: artifacts.plane.so/makeplane/plane-admin:v1.2.3
+    container_name: plane-admin
+    restart: always
+    depends_on:
+      - api
+      - web
+
+  live:
+    image: artifacts.plane.so/makeplane/plane-live:v1.2.3
+    container_name: plane-live
+    restart: always
+    environment:
+      <<: [*live-env, *redis-env]
+    depends_on:
+      - api
+      - web
+
+  api:
+    image: artifacts.plane.so/makeplane/plane-backend:v1.2.3
+    container_name: plane-api
+    restart: always
+    command: ./bin/docker-entrypoint-api.sh
+    volumes:
+      - logs_api:/code/plane/logs
+    environment:
+      <<: [*app-env, *db-env, *redis-env, *minio-env, *aws-s3-env, *proxy-env]
+    depends_on:
+      - plane-db
+      - plane-redis
+      - plane-mq
+
+  worker:
+    image: artifacts.plane.so/makeplane/plane-backend:v1.2.3
+    container_name: plane-worker
+    restart: always
+    command: ./bin/docker-entrypoint-worker.sh
+    volumes:
+      - logs_worker:/code/plane/logs
+    environment:
+      <<: [*app-env, *db-env, *redis-env, *minio-env, *aws-s3-env, *proxy-env]
+    depends_on:
+      - api
+      - plane-db
+      - plane-redis
+      - plane-mq
+
+  beat-worker:
+    image: artifacts.plane.so/makeplane/plane-backend:v1.2.3
+    container_name: plane-beat-worker
+    restart: always
+    command: ./bin/docker-entrypoint-beat.sh
+    volumes:
+      - logs_beat-worker:/code/plane/logs
+    environment:
+      <<: [*app-env, *db-env, *redis-env, *minio-env, *aws-s3-env, *proxy-env]
+    depends_on:
+      - api
+      - plane-db
+      - plane-redis
+      - plane-mq
+
+  migrator:
+    image: artifacts.plane.so/makeplane/plane-backend:v1.2.3
+    container_name: plane-migrator
+    restart: "no"
+    command: ./bin/docker-entrypoint-migrator.sh
+    volumes:
+      - logs_migrator:/code/plane/logs
+    environment:
+      <<: [*app-env, *db-env, *redis-env, *minio-env, *aws-s3-env, *proxy-env]
+    depends_on:
+      - plane-db
+      - plane-redis
+
+  # Plane専用PostgreSQL (既存DBとは分離)
+  plane-db:
+    image: postgres:15.7-alpine
+    container_name: plane-db
+    restart: always
+    command: postgres -c 'max_connections=1000'
+    environment:
+      <<: *db-env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Plane専用Valkey/Redis (既存とは分離)
+  plane-redis:
+    image: valkey/valkey:7.2.11-alpine
+    container_name: plane-redis
+    restart: always
+    volumes:
+      - redisdata:/data
+
+  # RabbitMQ メッセージキュー
+  plane-mq:
+    image: rabbitmq:3.13.6-management-alpine
+    container_name: plane-mq
+    restart: always
+    environment:
+      <<: *mq-env
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  # MinIO オブジェクトストレージ
+  plane-minio:
+    image: minio/minio:latest
+    container_name: plane-minio
+    restart: always
+    command: server /export --console-address ":9090"
+    environment:
+      <<: *minio-env
+    volumes:
+      - uploads:/export
+
+  # リバースプロキシ - Cloudflare Tunnelからport 8082へ接続
+  proxy:
+    image: artifacts.plane.so/makeplane/plane-proxy:v1.2.3
+    container_name: plane-proxy
+    restart: always
+    environment:
+      <<: *proxy-env
+    ports:
+      - "8082:80"
+    depends_on:
+      - web
+      - api
+      - space
+      - admin
+      - live
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+  logs_api:
+  logs_worker:
+  logs_beat-worker:
+  logs_migrator:
+  rabbitmq_data:
